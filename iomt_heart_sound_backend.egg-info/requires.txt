@@ -1,0 +1,16 @@
+alembic<2.0,>=1.13
+bleak<1.0,>=0.22
+fastapi<1.0,>=0.115
+librosa<1.0,>=0.10
+numpy<3.0,>=1.26
+psycopg[binary]<4.0,>=3.2
+PyWavelets<2.0,>=1.6
+pydantic-settings<3.0,>=2.3
+scikit-learn<2.0,>=1.5
+scipy<2.0,>=1.13
+sqlalchemy<3.0,>=2.0
+uvicorn[standard]<1.0,>=0.30
+
+[dev]
+httpx<1.0,>=0.27
+pytest<9.0,>=8.2

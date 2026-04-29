@@ -1,0 +1,522 @@
+Metadata-Version: 2.4
+Name: iomt-heart-sound-backend
+Version: 0.1.0
+Summary: Doctor-facing heart sound measurement backend
+Requires-Python: >=3.12
+Description-Content-Type: text/markdown
+Requires-Dist: alembic<2.0,>=1.13
+Requires-Dist: bleak<1.0,>=0.22
+Requires-Dist: fastapi<1.0,>=0.115
+Requires-Dist: librosa<1.0,>=0.10
+Requires-Dist: numpy<3.0,>=1.26
+Requires-Dist: psycopg[binary]<4.0,>=3.2
+Requires-Dist: PyWavelets<2.0,>=1.6
+Requires-Dist: pydantic-settings<3.0,>=2.3
+Requires-Dist: scikit-learn<2.0,>=1.5
+Requires-Dist: scipy<2.0,>=1.13
+Requires-Dist: sqlalchemy<3.0,>=2.0
+Requires-Dist: uvicorn[standard]<1.0,>=0.30
+Provides-Extra: dev
+Requires-Dist: httpx<1.0,>=0.27; extra == "dev"
+Requires-Dist: pytest<9.0,>=8.2; extra == "dev"
+
+# Heart Sound Measurement Backend
+
+Production-style REST backend for a doctor-facing heart sound measurement app. The frontend is assumed to already exist and only polls/acts through REST.
+
+## Stack
+
+- Python 3.12
+- FastAPI
+- SQLAlchemy 2.0
+- Alembic
+- PostgreSQL
+- Pytest
+
+## Features
+
+- Partial, case-insensitive patient search
+- Historical heart recording lookup per patient
+- Live measurement polling endpoint with Arduino BLE ingestion or mock waveform fallback
+- Record/stop session actions with state-transition protection
+- On-demand PCG analysis endpoint for saved recordings with chart-ready waveform JSON
+- Pydantic validation and consistent JSON error responses
+- Alembic migration for schema creation
+- Seed data for 5 patients and 10 historical recordings
+- Built-in OpenAPI docs at `/docs` and raw schema at `/openapi.json`
+
+## Project Structure
+
+```text
+app/
+  api/routes/              REST endpoints
+  core/                    config, DB, errors, logging
+  models/                  SQLAlchemy models
+  schemas/                 request/response DTOs
+  services/                business logic and waveform generation
+  seed_data.py             reusable seed dataset
+alembic/
+  env.py
+  versions/
+scripts/
+  seed.py
+tests/
+```
+
+## Setup
+
+1. Create a virtual environment.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+2. Install dependencies.
+
+```bash
+pip install -e ".[dev]"
+```
+
+3. Create PostgreSQL database.
+
+```bash
+createdb iomt_backend
+```
+
+4. Copy the example environment file.
+
+```bash
+cp .env.example .env
+```
+
+5. Update `DATABASE_URL` in `.env` if needed, then run migrations.
+
+```bash
+alembic upgrade head
+```
+
+6. Seed the database.
+
+```bash
+python -m scripts.seed
+```
+
+7. Start the API.
+
+```bash
+uvicorn app.main:app --reload
+```
+
+## Docker
+
+The repo now includes:
+
+- [Dockerfile](/Users/aliheydarabadii/Desktop/uni/iomt_backend/Dockerfile)
+- [docker-compose.yml](/Users/aliheydarabadii/Desktop/uni/iomt_backend/docker-compose.yml)
+- [scripts/docker-entrypoint.sh](/Users/aliheydarabadii/Desktop/uni/iomt_backend/scripts/docker-entrypoint.sh)
+
+Start the full stack:
+
+```bash
+docker compose up --build
+```
+
+This starts:
+
+- `db`: PostgreSQL 16
+- `api`: the FastAPI backend on `http://localhost:8000`
+- `audio_data`: a Docker volume for saved `.wav` files
+
+Behavior on container start:
+
+- runs `alembic upgrade head`
+- runs the idempotent seed script
+- starts `uvicorn`
+
+Useful commands:
+
+```bash
+docker compose up --build -d
+docker compose logs -f api
+docker compose down
+docker compose down -v
+```
+
+## Environment
+
+Example values are in [.env.example](/Users/aliheydarabadii/Desktop/uni/iomt_backend/.env.example).
+
+```env
+APP_NAME=Heart Sound Measurement Backend
+ENVIRONMENT=development
+DEBUG=true
+DATABASE_URL=postgresql+psycopg://postgres:postgres@localhost:5432/iomt_backend
+CORS_ORIGINS=http://localhost:5173
+AUDIO_BASE_URL=/media/audio
+AUDIO_STORAGE_DIR=storage/audio
+IDLE_WAVEFORM_SIZE=180
+LIVE_WAVEFORM_SIZE=180
+LOG_LEVEL=INFO
+BLE_ENABLED=false
+BLE_DEVICE_NAME=PCG_Monitor
+BLE_SERVICE_UUID=12345678-1234-1234-1234-123456789abc
+BLE_CHARACTERISTIC_UUID=abcd1234-ab12-cd34-ef56-123456789abc
+BLE_SAMPLE_RATE=500
+BLE_BATCH_SIZE=20
+AUDIO_SAMPLE_RATE=500
+AUDIO_GAIN=2.0
+BLE_TIMER_INTERVAL_MS=20
+BLE_SCAN_TIMEOUT_SECONDS=3.0
+BLE_CONNECT_TIMEOUT_SECONDS=10.0
+BLE_RETRY_DELAY_SECONDS=2.0
+BLE_POLL_INTERVAL_SECONDS=0.1
+BLE_STALE_AFTER_SECONDS=1.5
+BLE_RECENT_BUFFER_SIZE=2048
+BLE_CAPTURE_BUFFER_SIZE=120000
+```
+
+Docker Compose overrides `DATABASE_URL` to point at the `db` service:
+
+```env
+DATABASE_URL=postgresql+psycopg://postgres:postgres@db:5432/iomt_backend
+AUDIO_BASE_URL=/media/audio
+AUDIO_STORAGE_DIR=/app/storage/audio
+```
+
+## BLE Integration
+
+The backend can ingest heart-sound sample batches directly from an Arduino BLE peripheral using `bleak`.
+
+Expected BLE payload:
+
+- notifications on `BLE_CHARACTERISTIC_UUID`
+- optional service verification against `BLE_SERVICE_UUID`
+- little-endian unsigned 16-bit samples
+- each notification decoded like your PyQt worker:
+
+```python
+n_samples = len(data) // 2
+values = list(struct.unpack(f"<{n_samples}H", data))
+```
+
+How it behaves:
+
+- when `BLE_ENABLED=true`, the API starts a background BLE worker on app startup
+- it scans for a device whose name contains `BLE_DEVICE_NAME`
+- it prefers scan results advertising `BLE_SERVICE_UUID` and verifies that service after connect
+- it subscribes to `BLE_CHARACTERISTIC_UUID`
+- it keeps a rolling sample window for `GET /api/heart-measurements/current`
+- `POST /api/heart-measurements/:patientId/record` starts an in-memory capture buffer
+- `POST /api/heart-measurements/:patientId/stop` summarizes captured BLE samples into the stored recording metadata
+
+Required environment variables for host BLE use:
+
+```env
+BLE_ENABLED=true
+BLE_DEVICE_NAME=PCG_Monitor
+BLE_SERVICE_UUID=12345678-1234-1234-1234-123456789abc
+BLE_CHARACTERISTIC_UUID=abcd1234-ab12-cd34-ef56-123456789abc
+BLE_SAMPLE_RATE=500
+BLE_BATCH_SIZE=20
+AUDIO_SAMPLE_RATE=500
+AUDIO_GAIN=2.0
+BLE_TIMER_INTERVAL_MS=20
+```
+
+Derived runtime value:
+
+- `SAMPLES_PER_TICK = SAMPLE_RATE * TIMER_INTERVAL_MS // 1000`
+- with your values, `500 * 20 // 1000 = 10`
+
+Important runtime note:
+
+- BLE is best run directly on the host with `uvicorn`
+- Docker Compose is configured with `BLE_ENABLED=false` by default
+- on macOS especially, Docker Desktop containers do not have straightforward access to host Bluetooth hardware
+
+## Audio Files
+
+Completed recordings are now saved as real WAV files.
+Saved recordings can also be analyzed later through the PCG pipeline endpoint.
+
+Default local storage:
+
+- disk path: `storage/audio/<recording_id>.wav`
+- static URL: `/media/audio/<recording_id>.wav`
+- API URL: `/api/heart-recordings/<recording_id>/audio`
+- analysis URL: `/api/heart-recordings/<recording_id>/analysis`
+
+Docker Compose storage:
+
+- container path: `/app/storage/audio/<recording_id>.wav`
+- persisted volume: `audio_data`
+
+The backend saves mono 16-bit WAV files and exposes them through FastAPI static file serving when `AUDIO_BASE_URL` is a relative path such as `/media/audio`.
+New recordings now store `audioUrl` as the API route `/api/heart-recordings/<recording_id>/audio`.
+The analysis endpoint runs the saved WAV through a PCG processing pipeline and returns JSON suitable for waveform, envelope, peak, and segmentation plots.
+
+## API
+
+Base URL: `http://localhost:8000`
+
+### Search patients
+
+```bash
+curl "http://localhost:8000/api/patients/search?name=smith"
+```
+
+Sample response:
+
+```json
+{
+  "patients": [
+    {
+      "id": "patient_001",
+      "fullName": "John Smith",
+      "mrn": "MRN-10021",
+      "age": 58,
+      "sex": "Male",
+      "dob": "1967-03-14",
+      "latestVisit": "2026-04-12T10:20:00Z",
+      "recordings": [
+        {
+          "id": "rec_001",
+          "areaId": "aortic",
+          "areaLabel": "Aortic",
+          "areaShort": "2nd ICS · right sternal border",
+          "capturedAt": "2026-04-10T09:00:00Z",
+          "durationMs": 12800,
+          "status": "Stored on server",
+          "audioUrl": "https://example.com/audio/rec_001.wav"
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Create patient
+
+```bash
+curl -X POST "http://localhost:8000/api/patients" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "fullName": "Daniel Carter",
+    "mrn": "MRN-10999",
+    "sex": "Male",
+    "dob": "1989-05-02",
+    "latestVisit": "2026-04-13T09:00:00Z"
+  }'
+```
+
+Behavior:
+
+- generates a server-side patient ID like `patient_006`
+- computes `age` from `dob` and `latestVisit` date
+- returns `409` if the `mrn` already exists
+
+Sample response:
+
+```json
+{
+  "id": "patient_006",
+  "fullName": "Daniel Carter",
+  "mrn": "MRN-10999",
+  "age": 36,
+  "sex": "Male",
+  "dob": "1989-05-02",
+  "latestVisit": "2026-04-13T09:00:00Z",
+  "recordings": []
+}
+```
+
+### Poll current measurement
+
+```bash
+curl "http://localhost:8000/api/heart-measurements/current?patientId=patient_001&patientName=John%20Smith"
+```
+
+Behavior:
+
+- `patientId` is primary lookup
+- `patientName` is accepted as fallback
+- idle sessions return `isRecording=false` plus a low-amplitude waveform
+
+### Start recording
+
+```bash
+curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/record" \
+  -H "Content-Type: application/json" \
+  -d '{"areaId":"aortic"}'
+```
+
+Sample response:
+
+```json
+{
+  "success": true,
+  "message": "Recording started"
+}
+```
+
+### Single recording control endpoint
+
+Use this if you want one endpoint for both start and stop actions.
+
+Start:
+
+```bash
+curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/recording" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"start","areaId":"aortic"}'
+```
+
+Stop:
+
+```bash
+curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/recording" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"stop"}'
+```
+
+Behavior:
+
+- `action=start` requires `areaId`
+- `action=stop` does not require `areaId`
+- returns `201` for start and `200` for stop
+
+### Stop recording
+
+```bash
+curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/stop"
+```
+
+Sample response:
+
+```json
+{
+  "success": true,
+  "message": "Recording stopped"
+}
+```
+
+### Get recorded audio file
+
+```bash
+curl -L "http://localhost:8000/api/heart-recordings/rec_001/audio" --output rec_001.wav
+```
+
+Behavior:
+
+- for new locally saved recordings, the endpoint returns the WAV file directly
+- for historical rows that still store an external `audioUrl`, the endpoint redirects to that URL
+- returns `404` if the recording or file does not exist
+
+### Analyze a recorded file for plotting
+
+This runs the saved local WAV through the PCG pipeline on demand and returns analysis JSON.
+
+```bash
+curl "http://localhost:8000/api/heart-recordings/rec_a1b2c3d4e5/analysis?includeSignals=true&maxPoints=2500"
+```
+
+Useful query params:
+
+- `includeSignals=true` includes downsampled waveform arrays for plotting
+- `maxPoints=2500` caps returned chart points per signal line
+- `saveFilteredWav=true` also writes `<recording_id>_filtered.wav` beside the original file
+
+Sample response:
+
+```json
+{
+  "recordingId": "rec_a1b2c3d4e5",
+  "audioUrl": "/api/heart-recordings/rec_a1b2c3d4e5/audio",
+  "generatedAt": "2026-04-26T11:30:00Z",
+  "plot": {
+    "sampleRateHz": 500,
+    "durationS": 5.0,
+    "pointCount": 2500,
+    "maxPoints": 2500,
+    "downsampled": true,
+    "timeAxisS": [0.0, 0.002, 0.004],
+    "amplitude": [0.01, 0.08, 0.03],
+    "envelope": [0.0, 0.02, 0.05],
+    "peakTimesS": [0.42, 1.17],
+    "s1TimesS": [0.42],
+    "s2TimesS": [1.17]
+  },
+  "analysis": {
+    "file_info": {
+      "sample_rate_hz": 500,
+      "duration_s": 5.0
+    }
+  }
+}
+```
+
+Frontend plotting notes:
+
+- use `plot.timeAxisS` for the x-axis
+- use `plot.amplitude` for the amplitude line
+- use `plot.envelope` for an optional second line or overlay
+- use `analysis.segmentation.segments` for colored S1/Systole/S2/Diastole spans
+- use `analysis.peaks.s1_times_s` and `analysis.peaks.s2_times_s` for markers
+
+## Error Format
+
+All handled errors follow the same shape:
+
+```json
+{
+  "error": {
+    "code": "validation_error",
+    "message": "Invalid request input",
+    "details": []
+  }
+}
+```
+
+Status rules:
+
+- `400` invalid input
+- `404` missing patient
+- `409` invalid state transition, such as stopping when no recording is active
+- `500` unexpected server/database failures
+
+## Notes On Live Waveforms
+
+- Returned waveform values are normalized between `0` and `1`
+- Live sessions return a synthetic rolling window sized by `LIVE_WAVEFORM_SIZE`
+- Idle sessions return a low-amplitude waveform centered near `0.5`
+- Completed recordings store a waveform summary, not raw sample history
+
+## Frontend Configuration
+
+Use these values in the frontend:
+
+```env
+VITE_PATIENT_SEARCH_ENDPOINT=http://localhost:8000/api/patients/search
+VITE_HEART_MEASUREMENT_ENDPOINT=http://localhost:8000/api/heart-measurements/current
+VITE_HEART_MEASUREMENT_POLL_MS=1000
+```
+
+## Tests
+
+Run:
+
+```bash
+pytest
+```
+
+Coverage currently includes:
+
+- waveform normalization and generation
+- measurement service lifecycle logic
+- integration tests for the 4 canonical endpoints
+
+## OpenAPI
+
+- Swagger UI: [http://localhost:8000/docs](http://localhost:8000/docs)
+- OpenAPI JSON: [http://localhost:8000/openapi.json](http://localhost:8000/openapi.json)
