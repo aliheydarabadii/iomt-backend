@@ -1,7 +1,6 @@
 import asyncio
 import concurrent.futures
 import logging
-import struct
 import threading
 import time
 from collections import deque
@@ -297,63 +296,65 @@ class BLEIngestionService:
         )
 
     async def _ble_loop(self, run_id: int) -> None:
+        # The actual BLE I/O is delegated to PCGClient (pcg_ble_client.py). The
+        # import is local so the module stays importable when bleak/numpy are
+        # absent; is_enabled already guards that case before we get here.
+        from app.services.pcg_ble_client import (
+            BLEConnectionError,
+            PCGClient,
+            PCGClientConfig,
+        )
+
         while self._is_current_run(run_id):
+            client = PCGClient(
+                device_name=self.settings.ble_device_name or PCGClientConfig.patient_name
+            )
             try:
-                address = self.settings.ble_device_address
-                device_name = self.settings.ble_device_name
-                if not address:
-                    self._set_connection_state("scanning")
-                    logger.info("[BLE] Scanning for device...")
-                    target = None
-                    while target is None and self._is_current_run(run_id):
-                        target = await BleakScanner.find_device_by_filter(
-                            self._matches_advertised_device,
-                            timeout=self.settings.ble_scan_timeout_seconds,
-                        )
-                        if target is None:
-                            message = f"'{device_name}' not found, retrying..."
-                            with self._lock:
-                                self._last_error = message
-                            logger.info("[BLE] %s", message)
-                            await asyncio.sleep(self.settings.ble_retry_delay_seconds)
+                self._set_connection_state("scanning")
+                logger.info("[BLE] Scanning for device %s...", client.device_name)
+                await client.connect()
+                self._set_connection_state("connected")
+                self._last_batch_monotonic = None
+                logger.info("[BLE] Connected: %s", client.is_connected())
 
-                    if not self._is_current_run(run_id) or target is None:
-                        return
-
-                    address = target.address
-                    display_name = target.name
-                    logger.info("[BLE] Found device: %s [%s]", target.name, target.address)
-                else:
-                    display_name = address
-
-                self._set_connection_state("connecting")
-                logger.info("[BLE] Connecting to %s (%s)", display_name, address)
-
-                async with BleakClient(address) as client:
-                    self._set_connection_state("connected")
-                    self._last_batch_monotonic = None
-                    logger.info("[BLE] Connected: %s", client.is_connected)
-
-                    def on_notify(_handle: int, data: bytearray) -> None:
-                        self._consume_notification(data)
-
-                    await client.start_notify(self.settings.ble_characteristic_uuid, on_notify)
-                    logger.info("[BLE] Receiving notifications...")
-
-                    while self._is_current_run(run_id) and client.is_connected:
-                        await asyncio.sleep(self.settings.ble_poll_interval_seconds)
-
-                    with suppress(Exception):
-                        await client.stop_notify(self.settings.ble_characteristic_uuid)
+                # PCGClient.analyze() streams for a fixed duration then returns.
+                # Re-run it back-to-back so the live waveform keeps flowing while
+                # the worker is meant to be running.
+                while self._is_current_run(run_id) and client.is_connected():
+                    patient_name = self._current_patient_name() or PCGClientConfig.patient_name
+                    async for batch in client.analyze(
+                        sample_rate=self.settings.ble_sample_rate,
+                        oversample_count=self.settings.ble_oversample_count,
+                        batch_size=self.settings.ble_batch_size,
+                        patient_name=patient_name,
+                        analysis_time_seconds=self.settings.ble_analysis_time_seconds,
+                    ):
+                        if not self._is_current_run(run_id):
+                            break
+                        self._consume_samples([int(sample) for sample in batch])
 
                 self._set_connection_state("disconnected")
                 logger.info("[BLE] Disconnected")
+            except BLEConnectionError as exc:
+                self._set_connection_state(f"error:{exc}")
+                with self._lock:
+                    self._last_error = str(exc)
+                logger.warning("[BLE] %s", exc)
             except Exception as exc:  # pragma: no cover - depends on hardware/runtime
                 self._set_connection_state(f"error:{exc}")
                 with self._lock:
                     self._last_error = str(exc)
                 logger.exception("BLE worker error", exc_info=exc)
+            finally:
+                with suppress(Exception):
+                    await client.disconnect()
+
+            if self._is_current_run(run_id):
                 await asyncio.sleep(self.settings.ble_retry_delay_seconds)
+
+    def _current_patient_name(self) -> str | None:
+        with self._lock:
+            return self._active_capture_patient_id
 
     def _resolve_event_loop(self) -> asyncio.AbstractEventLoop | None:
         if self._loop and self._loop.is_running():
@@ -390,18 +391,6 @@ class BLEIngestionService:
             if self._run_id == run_id:
                 self._running = False
                 self._future = None
-
-    def _consume_notification(self, data: bytearray) -> None:
-        values = self._decode_notification(data)
-        if not values:
-            return
-        self._consume_samples(values)
-
-    def _decode_notification(self, data: bytearray):
-        n_samples = len(data) // 2
-        if n_samples <= 0:
-            return []
-        return struct.unpack(f"<{n_samples}H", data[: n_samples * 2])
 
     def _consume_samples(self, values) -> None:
         n_samples = len(values)
