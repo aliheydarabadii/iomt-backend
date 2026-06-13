@@ -41,6 +41,8 @@ class Settings(BaseSettings):
     ble_payload_format: str = "uint16-le"
     ble_sample_rate: int = 500
     ble_batch_size: int = 20
+    ble_oversample_count: int = 8
+    ble_analysis_time_seconds: int = 60
     audio_sample_rate: int = 500
     audio_gain: float = 2.0
     ble_timer_interval_ms: int = 20
