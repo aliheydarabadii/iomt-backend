@@ -16,7 +16,7 @@ Production-style REST backend for a doctor-facing heart sound measurement app. T
 - Partial, case-insensitive patient search
 - Historical heart recording lookup per patient
 - Live measurement polling endpoint with Arduino BLE ingestion or mock waveform fallback
-- Record/stop session actions with state-transition protection
+- Single fixed-duration record action that captures and stores in one call
 - On-demand PCG analysis endpoint for saved recordings with chart-ready waveform JSON
 - Pydantic validation and consistent JSON error responses
 - Alembic migration for schema creation
@@ -190,8 +190,7 @@ How it behaves:
 - otherwise it finds the first advertised device matching `BLE_DEVICE_NAME`, advertised local name, or `BLE_SERVICE_UUID`
 - it subscribes to `BLE_CHARACTERISTIC_UUID`
 - it keeps a rolling sample window for `GET /api/heart-measurements/current`
-- `POST /api/heart-measurements/:patientId/record` starts an in-memory capture buffer
-- `POST /api/heart-measurements/:patientId/stop` summarizes captured BLE samples into the stored recording metadata
+- `POST /api/heart-measurements/:patientId/record` records for `BLE_ANALYSIS_TIME_SECONDS`, then summarizes the captured BLE samples into the stored recording metadata — there is no separate stop call, the Arduino records for the configured duration and the request returns once it completes
 
 Required environment variables for host BLE use:
 
@@ -351,7 +350,12 @@ Behavior:
 - `patientName` is accepted as fallback
 - idle sessions return `isRecording=false` plus a low-amplitude waveform
 
-### Start recording
+### Record
+
+A single call records for `BLE_ANALYSIS_TIME_SECONDS` and stores the result.
+The Arduino samples for the configured duration and stops on its own, so the
+request blocks until the capture window completes — there is no separate stop
+call.
 
 ```bash
 curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/record" \
@@ -364,50 +368,14 @@ Sample response:
 ```json
 {
   "success": true,
-  "message": "Recording started"
+  "message": "Recording stored"
 }
-```
-
-### Single recording control endpoint
-
-Use this if you want one endpoint for both start and stop actions.
-
-Start:
-
-```bash
-curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/recording" \
-  -H "Content-Type: application/json" \
-  -d '{"action":"start","areaId":"aortic"}'
-```
-
-Stop:
-
-```bash
-curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/recording" \
-  -H "Content-Type: application/json" \
-  -d '{"action":"stop"}'
 ```
 
 Behavior:
 
-- `action=start` requires `areaId`
-- `action=stop` does not require `areaId`
-- returns `201` for start and `200` for stop
-
-### Stop recording
-
-```bash
-curl -X POST "http://localhost:8000/api/heart-measurements/patient_001/stop"
-```
-
-Sample response:
-
-```json
-{
-  "success": true,
-  "message": "Recording stopped"
-}
-```
+- `areaId` is required
+- returns `201` once the recording has been captured and stored
 
 ### Get recorded audio file
 
@@ -490,7 +458,7 @@ Status rules:
 
 - `400` invalid input
 - `404` missing patient
-- `409` invalid state transition, such as stopping when no recording is active
+- `409` conflicting state, such as recording while one is already in progress, the BLE device being busy, or no BLE samples captured
 - `500` unexpected server/database failures
 
 ## Notes On Live Waveforms
