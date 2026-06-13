@@ -38,11 +38,8 @@ class CurrentSessionResponse(APIModel):
 
 class MeasurementControlsResponse(APIModel):
     canRecord: bool
-    canStop: bool
     recordUrl: str
-    stopUrl: str
     recordMethod: str
-    stopMethod: str
 
 
 class CurrentMeasurementResponse(APIModel):
@@ -63,35 +60,6 @@ class RecordActionRequest(APIModel):
         if cleaned not in AUSCULTATION_AREAS:
             raise ValueError(f"areaId must be one of: {', '.join(AUSCULTATION_AREAS)}")
         return cleaned
-
-
-class RecordingCommandRequest(APIModel):
-    action: str
-    areaId: str | None = None
-
-    @field_validator("action")
-    @classmethod
-    def validate_action(cls, value: str) -> str:
-        cleaned = value.strip().lower()
-        if cleaned not in {"start", "stop"}:
-            raise ValueError("action must be one of: start, stop")
-        return cleaned
-
-    @field_validator("areaId")
-    @classmethod
-    def validate_optional_area_id(cls, value: str | None) -> str | None:
-        if value is None:
-            return value
-        cleaned = value.strip()
-        if cleaned not in AUSCULTATION_AREAS:
-            raise ValueError(f"areaId must be one of: {', '.join(AUSCULTATION_AREAS)}")
-        return cleaned
-
-    @model_validator(mode="after")
-    def validate_action_payload(self) -> Self:
-        if self.action == "start" and not self.areaId:
-            raise ValueError("areaId is required when action is start")
-        return self
 
 
 class ActionResponse(APIModel):

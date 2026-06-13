@@ -1,4 +1,5 @@
 import random
+import time
 from uuid import uuid4
 
 from sqlalchemy import desc, select
@@ -108,11 +109,8 @@ class MeasurementService:
         recordings = self._list_recordings(patient.id)
         controls = MeasurementControlsResponse(
             canRecord=not bool(active_session),
-            canStop=bool(active_session),
             recordUrl=f"{self.settings.api_prefix}/heart-measurements/{patient.id}/record",
-            stopUrl=f"{self.settings.api_prefix}/heart-measurements/{patient.id}/stop",
             recordMethod="POST",
-            stopMethod="POST",
         )
         return CurrentMeasurementResponse(
             sourceLabel="REST endpoint",
@@ -122,7 +120,7 @@ class MeasurementService:
             records=recordings,
         )
 
-    def start_recording(self, *, patient_id: str, area_id: str) -> ActionResponse:
+    def record(self, *, patient_id: str, area_id: str) -> ActionResponse:
         patient = self._get_patient_or_404(patient_id, None)
         if area_id not in AUSCULTATION_AREAS:
             from app.core.errors import BadRequestError
@@ -144,7 +142,7 @@ class MeasurementService:
             )
 
         area_meta = AUSCULTATION_AREAS[area_id]
-        now = utcnow()
+        started_at = utcnow()
         session = HeartMeasurementSession(
             id=f"session_{uuid4().hex[:12]}",
             patient_id=patient.id,
@@ -153,51 +151,27 @@ class MeasurementService:
             area_short=area_meta["short"],
             state="recording",
             is_locked=True,
-            started_at=now,
+            started_at=started_at,
             stopped_at=None,
             stream_status=LIVE_STREAM_STATUS,
             signal_quality=DEFAULT_SIGNAL_QUALITY,
             waveform_seed=random.randint(10_000, 99_999),
-            created_at=now,
-            updated_at=now,
+            created_at=started_at,
+            updated_at=started_at,
         )
-        patient.latest_visit = now
+        patient.latest_visit = started_at
         self.db.add(session)
         self.db.commit()
-        return ActionResponse(success=True, message="Recording started")
 
-    def stop_recording(self, *, patient_id: str) -> ActionResponse:
-        patient = self._get_patient_or_404(patient_id, None)
-        session = self._get_active_session(patient.id)
-        if not session:
-            raise ConflictError(
-                "no_active_recording",
-                "No active recording session exists for this patient",
-            )
+        # The Arduino samples for a fixed duration and stops on its own, so we
+        # block here until that capture window completes, then persist it.
+        captured_samples = self._await_capture(patient.id)
 
         now = utcnow()
-        started_at = ensure_utc(session.started_at)
         duration_ms = max(int((now - started_at).total_seconds() * 1000), 1000)
-        if self.settings.ble_enabled:
-            if not self.ble_service.ensure_capture_binding(patient.id):
-                raise ConflictError(
-                    "ble_device_busy",
-                    "BLE sensor is already streaming to another active patient session",
-                )
-            capture_sample_count = self.ble_service.get_capture_sample_count(patient.id)
-            if capture_sample_count == 0:
-                raise ConflictError(
-                    "no_ble_audio_captured",
-                    "No BLE samples were captured for this recording session",
-                    {
-                        "durationMs": duration_ms,
-                        "expectedSampleCount": int(
-                            duration_ms * self.settings.ble_sample_rate / 1000
-                        ),
-                    },
-                )
-        captured_samples = self.ble_service.end_capture(patient.id)
         if self.settings.ble_enabled and not captured_samples:
+            self._mark_session_stopped(session, now)
+            self.db.commit()
             raise ConflictError(
                 "no_ble_audio_captured",
                 "No BLE samples were captured for this recording session",
@@ -243,14 +217,38 @@ class MeasurementService:
                 captured_sample_count=len(captured_samples),
             ),
         )
+        self._mark_session_stopped(session, now)
+        patient.latest_visit = now
+        self.db.add(recording)
+        self.db.commit()
+        return ActionResponse(success=True, message="Recording stored")
+
+    def _await_capture(self, patient_id: str) -> list[int]:
+        """Block until the fixed-duration capture window finishes, then drain it.
+
+        Only waits when BLE is enabled; otherwise there is nothing streaming and
+        we fall back to a synthetic waveform.
+        """
+        if self.settings.ble_enabled:
+            expected_samples = (
+                self.settings.ble_sample_rate * self.settings.ble_analysis_time_seconds
+            )
+            deadline = time.monotonic() + (
+                self.settings.ble_analysis_time_seconds
+                + self.settings.ble_capture_grace_seconds
+            )
+            while time.monotonic() < deadline:
+                if self.ble_service.get_capture_sample_count(patient_id) >= expected_samples:
+                    break
+                time.sleep(0.05)
+        return self.ble_service.end_capture(patient_id)
+
+    @staticmethod
+    def _mark_session_stopped(session: HeartMeasurementSession, now) -> None:
         session.state = "stopped"
         session.stopped_at = now
         session.stream_status = "Stopped"
         session.updated_at = now
-        patient.latest_visit = now
-        self.db.add(recording)
-        self.db.commit()
-        return ActionResponse(success=True, message="Recording stopped")
 
     def _get_patient_or_404(self, patient_id: str | None, patient_name: str | None) -> Patient:
         patient = self.patient_service.resolve_patient(patient_id, patient_name)

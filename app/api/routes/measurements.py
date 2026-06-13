@@ -1,6 +1,6 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Response, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -10,7 +10,6 @@ from app.schemas.measurements import (
     CurrentMeasurementQuery,
     CurrentMeasurementResponse,
     RecordActionRequest,
-    RecordingCommandRequest,
 )
 from app.services.measurement_service import MeasurementService
 
@@ -38,43 +37,11 @@ def get_current_measurement(
     response_model=ActionResponse,
     status_code=status.HTTP_201_CREATED,
     responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
-    summary="Start a new heart sound recording session",
+    summary="Record a heart sound session for the configured duration and store it",
 )
-def start_recording(
+def record(
     patient_id: str,
     payload: RecordActionRequest,
     db: Annotated[Session, Depends(get_db)],
 ) -> ActionResponse:
-    return MeasurementService(db).start_recording(patient_id=patient_id, area_id=payload.areaId)
-
-
-@router.post(
-    "/{patient_id}/stop",
-    response_model=ActionResponse,
-    responses={404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
-    summary="Stop the active heart sound recording session",
-)
-def stop_recording(
-    patient_id: str,
-    db: Annotated[Session, Depends(get_db)],
-) -> ActionResponse:
-    return MeasurementService(db).stop_recording(patient_id=patient_id)
-
-
-@router.post(
-    "/{patient_id}/recording",
-    response_model=ActionResponse,
-    responses={400: {"model": ErrorResponse}, 404: {"model": ErrorResponse}, 409: {"model": ErrorResponse}},
-    summary="Start or stop recording through a single action endpoint",
-)
-def control_recording(
-    patient_id: str,
-    payload: RecordingCommandRequest,
-    response: Response,
-    db: Annotated[Session, Depends(get_db)],
-) -> ActionResponse:
-    service = MeasurementService(db)
-    if payload.action == "start":
-        response.status_code = status.HTTP_201_CREATED
-        return service.start_recording(patient_id=patient_id, area_id=payload.areaId)
-    return service.stop_recording(patient_id=patient_id)
+    return MeasurementService(db).record(patient_id=patient_id, area_id=payload.areaId)

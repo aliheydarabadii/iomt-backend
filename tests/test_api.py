@@ -143,59 +143,14 @@ def test_current_measurement_endpoint_returns_idle_session(client) -> None:
     assert payload["controls"]["recordUrl"] == "/api/heart-measurements/patient_001/record"
 
 
-def test_record_endpoint_starts_recording(client) -> None:
+def test_record_endpoint_records_and_persists_history(client) -> None:
     response = client.post(
-        "/api/heart-measurements/patient_003/record",
-        json={"areaId": "mitral"},
-    )
-
-    assert response.status_code == 201
-    assert response.json() == {"success": True, "message": "Recording started"}
-
-    current = client.get(
-        "/api/heart-measurements/current",
-        params={"patientId": "patient_003"},
-    )
-    current_payload = current.json()
-    assert current_payload["currentSession"]["isRecording"] is True
-    assert current_payload["currentSession"]["activeAreaId"] == "mitral"
-    assert current_payload["controls"]["canStop"] is True
-
-
-def test_recording_command_endpoint_starts_and_stops_recording(client) -> None:
-    start = client.post(
-        "/api/heart-measurements/patient_005/recording",
-        json={"action": "start", "areaId": "aortic"},
-    )
-    assert start.status_code == 201
-    assert start.json() == {"success": True, "message": "Recording started"}
-
-    current = client.get(
-        "/api/heart-measurements/current",
-        params={"patientId": "patient_005"},
-    )
-    current_payload = current.json()
-    assert current_payload["currentSession"]["isRecording"] is True
-    assert current_payload["currentSession"]["activeAreaId"] == "aortic"
-
-    stop = client.post(
-        "/api/heart-measurements/patient_005/recording",
-        json={"action": "stop"},
-    )
-    assert stop.status_code == 200
-    assert stop.json() == {"success": True, "message": "Recording stopped"}
-
-
-def test_stop_endpoint_stops_recording_and_persists_history(client) -> None:
-    start = client.post(
         "/api/heart-measurements/patient_004/record",
         json={"areaId": "tricuspid"},
     )
-    assert start.status_code == 201
 
-    stop = client.post("/api/heart-measurements/patient_004/stop")
-    assert stop.status_code == 200
-    assert stop.json() == {"success": True, "message": "Recording stopped"}
+    assert response.status_code == 201
+    assert response.json() == {"success": True, "message": "Recording stored"}
 
     current = client.get(
         "/api/heart-measurements/current",
@@ -216,14 +171,11 @@ def test_recording_analysis_endpoint_returns_plotting_json(client) -> None:
     pytest.importorskip("pywt")
     pytest.importorskip("sklearn")
 
-    start = client.post(
+    record = client.post(
         "/api/heart-measurements/patient_003/record",
         json={"areaId": "aortic"},
     )
-    assert start.status_code == 201
-
-    stop = client.post("/api/heart-measurements/patient_003/stop")
-    assert stop.status_code == 200
+    assert record.status_code == 201
 
     current = client.get(
         "/api/heart-measurements/current",

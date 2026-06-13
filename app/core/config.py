@@ -43,6 +43,7 @@ class Settings(BaseSettings):
     ble_batch_size: int = 20
     ble_oversample_count: int = 8
     ble_analysis_time_seconds: int = 60
+    ble_capture_grace_seconds: float = 5.0
     audio_sample_rate: int = 500
     audio_gain: float = 2.0
     ble_timer_interval_ms: int = 20
