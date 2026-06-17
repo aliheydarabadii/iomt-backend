@@ -77,6 +77,8 @@ class BLEIngestionService:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._future: concurrent.futures.Future[None] | None = None
         self._run_id = 0
+        self._capture_requested = threading.Event()
+        self._active_capture_patient_name: str | None = None
 
         if not settings.ble_enabled:
             self._connection_state = "disabled"
@@ -112,6 +114,10 @@ class BLEIngestionService:
         if not self.is_enabled:
             return False
 
+        with self._lock:
+            if self._running and self._future and not self._future.done():
+                return True
+
         loop = self._resolve_event_loop()
         if loop is None:
             message = "BLE worker needs a running asyncio event loop"
@@ -122,8 +128,6 @@ class BLEIngestionService:
             return False
 
         with self._lock:
-            if self._running and self._future and not self._future.done():
-                return True
             self._running = True
             self._run_id += 1
             run_id = self._run_id
@@ -141,32 +145,38 @@ class BLEIngestionService:
             self._run_id += 1
             future = self._future
             self._future = None
+            self._active_capture_patient_id = None
+            self._active_capture_patient_name = None
+            self._capture_samples.clear()
+            self._capture_requested.clear()
         if future and not future.done():
             future.cancel()
         if self.is_enabled:
             self._set_connection_state("disconnected")
         logger.info("BLE ingestion worker stopped")
 
-    def begin_capture(self, patient_id: str) -> bool:
+    def begin_capture(self, patient_id: str, patient_name: str | None = None) -> bool:
         if not self.is_enabled:
             return True
-        self.start()
+        if not self.start():
+            return False
         with self._lock:
             if self._active_capture_patient_id and self._active_capture_patient_id != patient_id:
                 return False
             self._active_capture_patient_id = patient_id
+            self._active_capture_patient_name = patient_name or patient_id
             self._capture_samples.clear()
-            return True
+            self._recent_samples.clear()
+            self._last_batch_monotonic = None
+            if self._connection_state in {"connected", "receiving"}:
+                self._connection_state = "receiving"
+            self._capture_requested.set()
+        return True
 
     def ensure_capture_binding(self, patient_id: str) -> bool:
         if not self.is_enabled:
             return True
-        self.start()
         with self._lock:
-            if self._active_capture_patient_id is None:
-                self._active_capture_patient_id = patient_id
-                self._capture_samples.clear()
-                return True
             return self._active_capture_patient_id == patient_id
 
     def get_capture_sample_count(self, patient_id: str) -> int:
@@ -185,7 +195,13 @@ class BLEIngestionService:
                 return []
             samples = list(self._capture_samples)
             self._active_capture_patient_id = None
+            self._active_capture_patient_name = None
             self._capture_samples.clear()
+            self._recent_samples.clear()
+            self._last_batch_monotonic = None
+            self._capture_requested.clear()
+            if self._connection_state == "receiving":
+                self._connection_state = "connected"
             return samples
 
     def get_live_snapshot(self, *, size: int, idle_seed: int = 0) -> LiveWaveformSnapshot | None:
@@ -196,10 +212,12 @@ class BLEIngestionService:
             recent_samples = list(self._recent_samples)[-size:]
             last_batch_monotonic = self._last_batch_monotonic
             connection_state = self._connection_state
+            capture_is_active = self._active_capture_patient_id is not None
 
-        has_recent_signal = bool(recent_samples) and (
-            last_batch_monotonic is not None
-            and (time.monotonic() - last_batch_monotonic) <= self.settings.ble_stale_after_seconds
+        has_recent_signal = (
+            capture_is_active
+            and bool(recent_samples)
+            and self._has_recent_signal(last_batch_monotonic)
         )
         if has_recent_signal:
             return LiveWaveformSnapshot(
@@ -211,7 +229,9 @@ class BLEIngestionService:
 
         return LiveWaveformSnapshot(
             waveform=generate_idle_waveform(size=size, seed=idle_seed),
-            stream_status=self._status_label(connection_state),
+            stream_status=(
+                LIVE_STREAM_STATUS if capture_is_active else self._idle_status_label(connection_state)
+            ),
             signal_quality=IDLE_SIGNAL_QUALITY,
             has_live_data=False,
         )
@@ -242,13 +262,19 @@ class BLEIngestionService:
             notification_count = self._notification_count
             last_notification_at = self._last_batch_at
             last_error = self._last_error
+            last_batch_monotonic = self._last_batch_monotonic
         finally:
             self._lock.release()
 
+        capture_is_active = active_capture_patient_id is not None
         return BLEStatusSnapshot(
             enabled=self.is_enabled,
             connection_state=connection_state,
-            connection_label=self._status_label(connection_state),
+            connection_label=self._status_label_for_signal(
+                connection_state,
+                self._has_recent_signal(last_batch_monotonic),
+                capture_is_active,
+            ),
             is_running=self._running,
             device_name=self.settings.ble_device_name,
             service_uuid=self.settings.ble_service_uuid,
@@ -296,9 +322,6 @@ class BLEIngestionService:
         )
 
     async def _ble_loop(self, run_id: int) -> None:
-        # The actual BLE I/O is delegated to PCGClient (pcg_ble_client.py). The
-        # import is local so the module stays importable when bleak/numpy are
-        # absent; is_enabled already guards that case before we get here.
         from app.services.pcg_ble_client import (
             BLEConnectionError,
             PCGClient,
@@ -311,27 +334,16 @@ class BLEIngestionService:
             )
             try:
                 self._set_connection_state("scanning")
-                logger.info("[BLE] Scanning for device %s...", client.device_name)
                 await client.connect()
-                self._set_connection_state("connected")
-                self._last_batch_monotonic = None
-                logger.info("[BLE] Connected: %s", client.is_connected())
+                self._mark_connected()
+                logger.info("[BLE] Connected: %s", self._client_is_connected(client))
 
-                # PCGClient.analyze() streams for a fixed duration then returns.
-                # Re-run it back-to-back so the live waveform keeps flowing while
-                # the worker is meant to be running.
-                while self._is_current_run(run_id) and client.is_connected():
-                    patient_name = self._current_patient_name() or PCGClientConfig.patient_name
-                    async for batch in client.analyze(
-                        sample_rate=self.settings.ble_sample_rate,
-                        oversample_count=self.settings.ble_oversample_count,
-                        batch_size=self.settings.ble_batch_size,
-                        patient_name=patient_name,
-                        analysis_time_seconds=self.settings.ble_analysis_time_seconds,
-                    ):
-                        if not self._is_current_run(run_id):
-                            break
-                        self._consume_samples([int(sample) for sample in batch])
+                while self._is_current_run(run_id) and self._client_is_connected(client):
+                    request = await self._wait_for_capture_request(run_id)
+                    if request is None:
+                        break
+                    patient_id, patient_name = request
+                    await self._run_capture(client, patient_id, patient_name)
 
                 self._set_connection_state("disconnected")
                 logger.info("[BLE] Disconnected")
@@ -352,9 +364,40 @@ class BLEIngestionService:
             if self._is_current_run(run_id):
                 await asyncio.sleep(self.settings.ble_retry_delay_seconds)
 
-    def _current_patient_name(self) -> str | None:
-        with self._lock:
-            return self._active_capture_patient_id
+    async def _wait_for_capture_request(
+        self,
+        run_id: int,
+    ) -> tuple[str, str] | None:
+        poll_interval = min(max(self.settings.ble_poll_interval_seconds, 0.01), 0.25)
+        while self._is_current_run(run_id):
+            if self._capture_requested.is_set():
+                with self._lock:
+                    patient_id = self._active_capture_patient_id
+                    patient_name = self._active_capture_patient_name or patient_id
+                    self._capture_requested.clear()
+                if patient_id and patient_name:
+                    return patient_id, patient_name
+            await asyncio.sleep(poll_interval)
+        return None
+
+    async def _run_capture(self, client, patient_id: str, patient_name: str) -> None:
+        self._set_connection_state("receiving")
+        logger.info(
+            "[BLE] Starting %ss analysis capture for %s",
+            self.settings.ble_analysis_time_seconds,
+            patient_name,
+        )
+        async for batch in client.analyze(
+            sample_rate=self.settings.ble_sample_rate,
+            oversample_count=self.settings.ble_oversample_count,
+            batch_size=self.settings.ble_batch_size,
+            patient_name=patient_name,
+            analysis_time_seconds=self.settings.ble_analysis_time_seconds,
+        ):
+            if not self._is_capture_active(patient_id):
+                break
+            self._consume_samples([int(sample) for sample in batch], patient_id=patient_id)
+        self._mark_connected()
 
     def _resolve_event_loop(self) -> asyncio.AbstractEventLoop | None:
         if self._loop and self._loop.is_running():
@@ -365,6 +408,13 @@ class BLEIngestionService:
             return None
         self._loop = loop
         return loop
+
+    @staticmethod
+    def _client_is_connected(client) -> bool:
+        is_connected = getattr(client, "is_connected", False)
+        if callable(is_connected):
+            return bool(is_connected())
+        return bool(is_connected)
 
     def _is_current_run(self, run_id: int) -> bool:
         with self._lock:
@@ -392,17 +442,25 @@ class BLEIngestionService:
                 self._running = False
                 self._future = None
 
-    def _consume_samples(self, values) -> None:
+    def _is_capture_active(self, patient_id: str) -> bool:
+        with self._lock:
+            return self._active_capture_patient_id == patient_id
+
+    def _consume_samples(self, values, *, patient_id: str | None = None) -> None:
         n_samples = len(values)
         if n_samples <= 0:
             return
         with self._lock:
+            if patient_id is not None and self._active_capture_patient_id != patient_id:
+                return
             self._recent_samples.extend(values)
             if self._active_capture_patient_id:
                 self._capture_samples.extend(values)
+                self._connection_state = "receiving"
+            elif self._connection_state == "receiving":
+                self._connection_state = "connected"
             self._last_batch_monotonic = time.monotonic()
             self._last_batch_at = datetime.now(UTC)
-            self._connection_state = "receiving"
             self._last_error = None
             self._notification_count += 1
             notification_count = self._notification_count
@@ -458,6 +516,33 @@ class BLEIngestionService:
     def _set_connection_state(self, value: str) -> None:
         with self._lock:
             self._connection_state = value
+
+    def _mark_connected(self) -> None:
+        with self._lock:
+            self._connection_state = "connected"
+            self._last_batch_monotonic = None
+
+    def _has_recent_signal(self, last_batch_monotonic: float | None) -> bool:
+        return (
+            last_batch_monotonic is not None
+            and (time.monotonic() - last_batch_monotonic) <= self.settings.ble_stale_after_seconds
+        )
+
+    def _idle_status_label(self, connection_state: str) -> str:
+        return self._status_label_for_signal(connection_state, has_recent_signal=False)
+
+    @classmethod
+    def _status_label_for_signal(
+        cls,
+        connection_state: str,
+        has_recent_signal: bool,
+        capture_is_active: bool = False,
+    ) -> str:
+        if capture_is_active:
+            return LIVE_STREAM_STATUS
+        if connection_state == "receiving" and not has_recent_signal:
+            return cls._status_label("connected")
+        return cls._status_label(connection_state)
 
     @staticmethod
     def _status_label(connection_state: str) -> str:

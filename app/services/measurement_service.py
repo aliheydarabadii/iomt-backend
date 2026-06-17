@@ -61,8 +61,6 @@ class MeasurementService:
         patient = self._get_patient_or_404(patient_id, patient_name)
         active_session = self._get_active_session(patient.id)
         if active_session:
-            if self.settings.ble_enabled:
-                self.ble_service.ensure_capture_binding(patient.id)
             started_at = ensure_utc(active_session.started_at)
             runtime_ms = max(
                 int((utcnow() - started_at).total_seconds() * 1000),
@@ -135,7 +133,7 @@ class MeasurementService:
                 "recording_already_running",
                 "Recording is already in progress for this patient",
             )
-        if not self.ble_service.begin_capture(patient.id):
+        if not self.ble_service.begin_capture(patient.id, patient.full_name):
             raise ConflictError(
                 "ble_device_busy",
                 "BLE sensor is already streaming to another active patient session",
@@ -163,8 +161,8 @@ class MeasurementService:
         self.db.add(session)
         self.db.commit()
 
-        # The Arduino samples for a fixed duration and stops on its own, so we
-        # block here until that capture window completes, then persist it.
+        # PCGClient.analyze() runs for the configured capture window and yields
+        # BLE batches into the capture buffer.
         captured_samples = self._await_capture(patient.id)
 
         now = utcnow()
@@ -230,16 +228,8 @@ class MeasurementService:
         we fall back to a synthetic waveform.
         """
         if self.settings.ble_enabled:
-            expected_samples = (
-                self.settings.ble_sample_rate * self.settings.ble_analysis_time_seconds
-            )
-            deadline = time.monotonic() + (
-                self.settings.ble_analysis_time_seconds
-                + self.settings.ble_capture_grace_seconds
-            )
+            deadline = time.monotonic() + self.settings.ble_analysis_time_seconds
             while time.monotonic() < deadline:
-                if self.ble_service.get_capture_sample_count(patient_id) >= expected_samples:
-                    break
                 time.sleep(0.05)
         return self.ble_service.end_capture(patient_id)
 

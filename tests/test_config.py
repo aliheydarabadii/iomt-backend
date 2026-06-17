@@ -28,7 +28,7 @@ def test_settings_ble_defaults_match_device_profile() -> None:
     assert settings.ble_payload_format == "uint16-le"
     assert settings.ble_autostart is False
     assert settings.ble_sample_rate == 500
-    assert settings.ble_batch_size == 20
+    assert settings.ble_batch_size == 6
     assert settings.audio_sample_rate == 500
     assert settings.audio_gain == 2.0
     assert settings.ble_timer_interval_ms == 20

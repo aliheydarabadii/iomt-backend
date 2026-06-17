@@ -144,7 +144,7 @@ BLE_SERVICE_UUID=12345678-1234-1234-1234-123456789abc
 BLE_CHARACTERISTIC_UUID=abcd1234-ab12-cd34-ef56-123456789abc
 BLE_PAYLOAD_FORMAT=uint16-le
 BLE_SAMPLE_RATE=500
-BLE_BATCH_SIZE=20
+BLE_BATCH_SIZE=6
 AUDIO_SAMPLE_RATE=500
 AUDIO_GAIN=2.0
 BLE_TIMER_INTERVAL_MS=20
@@ -188,9 +188,8 @@ How it behaves:
 - set `BLE_AUTOSTART=true` only if you want BLE scanning to start during API startup
 - when `BLE_DEVICE_ADDRESS` is set, it connects directly to that address and skips scanning
 - otherwise it finds the first advertised device matching `BLE_DEVICE_NAME`, advertised local name, or `BLE_SERVICE_UUID`
-- it subscribes to `BLE_CHARACTERISTIC_UUID`
-- it keeps a rolling sample window for `GET /api/heart-measurements/current`
-- `POST /api/heart-measurements/:patientId/record` records for `BLE_ANALYSIS_TIME_SECONDS`, then summarizes the captured BLE samples into the stored recording metadata — there is no separate stop call, the Arduino records for the configured duration and the request returns once it completes
+- it connects to the BLE sensor but does not start analysis while idle
+- `POST /api/heart-measurements/:patientId/record` calls `PCGClient.analyze(sample_rate=500, oversample_count=8, batch_size=6, patient_name=<patient>, analysis_time_seconds=60)` and stores the yielded batches
 
 Required environment variables for host BLE use:
 
@@ -203,7 +202,7 @@ BLE_SERVICE_UUID=12345678-1234-1234-1234-123456789abc
 BLE_CHARACTERISTIC_UUID=abcd1234-ab12-cd34-ef56-123456789abc
 BLE_PAYLOAD_FORMAT=uint16-le
 BLE_SAMPLE_RATE=500
-BLE_BATCH_SIZE=20
+BLE_BATCH_SIZE=6
 AUDIO_SAMPLE_RATE=500
 AUDIO_GAIN=2.0
 BLE_TIMER_INTERVAL_MS=20

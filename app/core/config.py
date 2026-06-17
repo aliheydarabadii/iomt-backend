@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     ble_characteristic_uuid: str | None = "abcd1234-ab12-cd34-ef56-123456789abc"
     ble_payload_format: str = "uint16-le"
     ble_sample_rate: int = 500
-    ble_batch_size: int = 20
+    ble_batch_size: int = 6
     ble_oversample_count: int = 8
     ble_analysis_time_seconds: int = 60
     ble_capture_grace_seconds: float = 5.0

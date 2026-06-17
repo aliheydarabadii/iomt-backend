@@ -22,7 +22,7 @@ class FakeBLEService:
         self.captured_samples = captured_samples or []
         self.active_capture_patient_id: str | None = None
 
-    def begin_capture(self, _patient_id: str) -> bool:
+    def begin_capture(self, _patient_id: str, _patient_name: str | None = None) -> bool:
         if not self.begin_allowed:
             return False
         self.active_capture_patient_id = _patient_id
