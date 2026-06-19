@@ -15,6 +15,11 @@ class PCGClientConfig:
     batch_size: int = 6
     patient_name: str = "Test_Patient"
     analysis_time_seconds: int = 60
+    device_address: str | None = None
+    service_uuid: str = "12345678-1234-1234-1234-123456789abc"
+    characteristic_uuid: str = "abcd1234-ab12-cd34-ef56-123456789abc"
+    scan_timeout_seconds: float = 10.0
+    connect_timeout_seconds: float = 10.0
 
 class PCGClient:
     """
@@ -24,9 +29,23 @@ class PCGClient:
 
     SERVICE_UUID = "12345678-1234-1234-1234-123456789abc"
     CHARACTERISTIC_UUID = "abcd1234-ab12-cd34-ef56-123456789abc"
+    NOTIFICATION_TIMEOUT_SECONDS = 5.0
 
-    def __init__(self, device_name="PCG_Monitor_Raw"):
+    def __init__(
+        self,
+        device_name="PCG_Monitor_Raw",
+        device_address: str | None = None,
+        service_uuid: str | None = None,
+        characteristic_uuid: str | None = None,
+        scan_timeout_seconds: float = 10.0,
+        connect_timeout_seconds: float = 10.0,
+    ):
         self.device_name = device_name
+        self.device_address = device_address
+        self.service_uuid = service_uuid or self.SERVICE_UUID
+        self.characteristic_uuid = characteristic_uuid or self.CHARACTERISTIC_UUID
+        self.scan_timeout_seconds = scan_timeout_seconds
+        self.connect_timeout_seconds = connect_timeout_seconds
         self.client = None
         self._sample_rate = 0
         self._analysis_time_seconds = 0
@@ -35,38 +54,46 @@ class PCGClient:
 
     async def connect(self):
         """Establish BLE connection to Arduino."""
-        print(f"Searching for device: {self.device_name}")
+        print(f"Searching for device: {self.device_name or self.device_address or self.service_uuid}")
 
-        scanner = BleakScanner()
-        devices = await scanner.discover()
-
-        target_device = None
-        for device in devices:
-            if device.name == self.device_name:
-                target_device = device
-                break
-
+        target_device = await self._find_target_device()
         if target_device is None:
-            raise BLEConnectionError(f"Device '{self.device_name}' not found")
+            raise BLEConnectionError("Configured BLE device not found while advertising")
 
-        print(f"Found device: {target_device.address}")
+        print(f"Found device: {getattr(target_device, 'address', target_device)}")
 
         try:
-            self.client = BleakClient(target_device.address)
+            try:
+                self.client = BleakClient(target_device, timeout=self.connect_timeout_seconds)
+            except TypeError:
+                self.client = BleakClient(target_device)
             await self.client.connect()
             print("Connected to device")
-
-            # Give connection time to stabilize
-            await asyncio.sleep(1.0)
-
-            # Access services property to trigger discovery and MTU negotiation
-            services = self.client.services
-            print(f"Services discovered, MTU: {self.client.mtu_size}")
         except Exception as e:
+            await self._disconnect_safely()
             raise BLEConnectionError(f"Failed to connect: {e}")
+
+        if not self.is_connected():
+            await self._disconnect_safely()
+            raise BLEConnectionError("Failed to connect: client did not report an active BLE link")
+
+        # Give connection time to stabilize. Service/MTU inspection is useful
+        # for diagnostics, but some Bleak backends expose it lazily or not at
+        # all. Do not turn a live BLE link into a reconnect loop just because
+        # optional metadata could not be read.
+        await asyncio.sleep(1.0)
+        try:
+            services = self.client.services
+            mtu_size = getattr(self.client, "mtu_size", "unknown")
+            print(f"Services discovered: {bool(services)}, MTU: {mtu_size}")
+        except Exception as e:
+            print(f"Connected, but service metadata was unavailable: {e}")
 
     async def disconnect(self):
         """Close BLE connection."""
+        await self._disconnect_safely()
+
+    async def _disconnect_safely(self):
         if self.client and self.client.is_connected:
             await self.client.disconnect()
             print("Disconnected from device")
@@ -119,9 +146,9 @@ class PCGClient:
         # immediately; any notifications sent before we subscribe are silently
         # dropped by the BLE stack, so we'd lose the first batches.
         try:
-            print(f"Starting notifications on {self.CHARACTERISTIC_UUID}...")
+            print(f"Starting notifications on {self.characteristic_uuid}...")
             await self.client.start_notify(
-                self.CHARACTERISTIC_UUID,
+                self.characteristic_uuid,
                 self._notification_handler
             )
             print("Notifications started successfully")
@@ -133,7 +160,7 @@ class PCGClient:
                 await asyncio.sleep(1.0)
                 print(f"Retrying notifications after error: {e}")
                 await self.client.start_notify(
-                    self.CHARACTERISTIC_UUID,
+                    self.characteristic_uuid,
                     self._notification_handler
                 )
                 print("Notifications started on retry")
@@ -143,7 +170,7 @@ class PCGClient:
         # Now send START. We are already listening, so no batches are missed.
         try:
             await self.client.write_gatt_char(
-                self.CHARACTERISTIC_UUID,
+                self.characteristic_uuid,
                 packet,
                 response=False
             )
@@ -157,9 +184,12 @@ class PCGClient:
         batches_yielded = 0
 
         try:
-            timeout_seconds = analysis_time_seconds + 5  # Grace period
             while batches_yielded < expected_num_batches:
                 try:
+                    # START should produce notifications almost immediately.
+                    # Waiting for the full recording duration when none arrive
+                    # prevents the ingestion worker from reconnecting and retrying.
+                    timeout_seconds = self.NOTIFICATION_TIMEOUT_SECONDS
                     batch = await asyncio.wait_for(
                         self._batch_queue.get(),
                         timeout=timeout_seconds
@@ -167,14 +197,79 @@ class PCGClient:
                     yield batch
                     batches_yielded += 1
                 except asyncio.TimeoutError:
-                    print("Warning: Timeout waiting for batches")
+                    if batches_yielded == 0:
+                        raise BLEConnectionError(
+                            "No BLE notifications received after START command"
+                        )
+                    print(
+                        "Warning: BLE notification stream stalled after "
+                        f"{batches_yielded} batches"
+                    )
                     break
         finally:
             # Stop notifications
             try:
-                await self.client.stop_notify(self.CHARACTERISTIC_UUID)
+                await self.client.stop_notify(self.characteristic_uuid)
             except:
                 pass
+
+    async def _find_target_device(self):
+        if self.device_address:
+            find_by_address = getattr(BleakScanner, "find_device_by_address", None)
+            if callable(find_by_address):
+                try:
+                    device = await find_by_address(
+                        self.device_address,
+                        timeout=self.scan_timeout_seconds,
+                    )
+                    if device is not None:
+                        return device
+                except Exception:
+                    pass
+
+        try:
+            discovered = await BleakScanner.discover(
+                timeout=self.scan_timeout_seconds,
+                return_adv=True,
+            )
+        except TypeError:
+            discovered = await BleakScanner.discover(timeout=self.scan_timeout_seconds)
+
+        if isinstance(discovered, dict):
+            for device, advertisement_data in discovered.values():
+                if self._matches_device(device, advertisement_data):
+                    return device
+        else:
+            for device in discovered:
+                if self._matches_device(device, None):
+                    return device
+
+        if self.device_address:
+            return self.device_address
+        return None
+
+    def _matches_device(self, device, advertisement_data) -> bool:
+        if self.device_address and getattr(device, "address", None) == self.device_address:
+            return True
+        if self.device_name and getattr(device, "name", None) == self.device_name:
+            return True
+        if (
+            self.device_name
+            and advertisement_data is not None
+            and getattr(advertisement_data, "local_name", None) == self.device_name
+        ):
+            return True
+        advertised_service_uuids = self._advertised_service_uuids(advertisement_data)
+        return bool(
+            self.service_uuid
+            and self.service_uuid.lower() in [uuid.lower() for uuid in advertised_service_uuids]
+        )
+
+    @staticmethod
+    def _advertised_service_uuids(advertisement_data) -> list[str]:
+        if advertisement_data is None:
+            return []
+        return [str(uuid) for uuid in (advertisement_data.service_uuids or [])]
 
     def get_full_signal(self) -> np.ndarray:
         """
@@ -265,6 +360,3 @@ class PCGClient:
         except Exception as e:
             # bleak swallows callback exceptions silently; surface it.
             print(f"[notif] handler error: {e!r}")
-
-
-

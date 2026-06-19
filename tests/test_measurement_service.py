@@ -1,6 +1,7 @@
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
 from app.core.errors import ConflictError
 from app.core.time import utcnow
@@ -16,10 +17,12 @@ class FakeBLEService:
         begin_allowed: bool = True,
         live_snapshot: LiveWaveformSnapshot | None = None,
         captured_samples: list[int] | None = None,
+        enabled: bool = False,
     ) -> None:
         self.begin_allowed = begin_allowed
         self.live_snapshot = live_snapshot
         self.captured_samples = captured_samples or []
+        self.is_enabled = enabled
         self.active_capture_patient_id: str | None = None
 
     def begin_capture(self, _patient_id: str, _patient_name: str | None = None) -> bool:
@@ -39,6 +42,9 @@ class FakeBLEService:
         if self.active_capture_patient_id != patient_id:
             return 0
         return len(self.captured_samples)
+
+    def is_capture_active(self, patient_id: str) -> bool:
+        return self.active_capture_patient_id == patient_id
 
     def end_capture(self, _patient_id: str) -> list[int]:
         if self.active_capture_patient_id != _patient_id:
@@ -152,3 +158,74 @@ def test_record_in_ble_mode_fails_when_no_samples_were_captured(
 
     with pytest.raises(ConflictError):
         service.record(patient_id="patient_001", area_id="aortic")
+
+    session = db_session.scalar(
+        select(HeartMeasurementSession)
+        .where(HeartMeasurementSession.patient_id == "patient_001")
+        .order_by(HeartMeasurementSession.started_at.desc())
+    )
+    assert session is not None
+    assert session.state == "failed"
+    assert session.is_locked is False
+    assert fake_ble_service.active_capture_patient_id is None
+
+
+def test_current_measurement_recovers_session_left_by_backend_restart(
+    db_session,
+    test_settings,
+) -> None:
+    ble_settings = test_settings.model_copy(update={"ble_enabled": True})
+    fake_ble_service = FakeBLEService(enabled=True)
+    service = MeasurementService(
+        db_session,
+        settings=ble_settings,
+        ble_service=fake_ble_service,
+    )
+    _insert_active_session(db_session, "patient_001", "aortic")
+
+    current = service.get_current_measurement(
+        patient_id="patient_001",
+        patient_name=None,
+    )
+
+    assert current.currentSession.isRecording is False
+    assert current.controls.canRecord is True
+    session = db_session.get(
+        HeartMeasurementSession,
+        "session_test_patient_001",
+    )
+    assert session is not None
+    assert session.state == "failed"
+    assert session.is_locked is False
+
+
+def test_record_exception_releases_capture_and_marks_session_failed(
+    db_session,
+    test_settings,
+    monkeypatch,
+) -> None:
+    fake_ble_service = FakeBLEService(enabled=True)
+    ble_settings = test_settings.model_copy(update={"ble_enabled": True})
+    service = MeasurementService(
+        db_session,
+        settings=ble_settings,
+        ble_service=fake_ble_service,
+    )
+
+    def fail_capture(_patient_id: str):
+        raise RuntimeError("sensor disconnected")
+
+    monkeypatch.setattr(service, "_await_capture", fail_capture)
+
+    with pytest.raises(RuntimeError, match="sensor disconnected"):
+        service.record(patient_id="patient_001", area_id="aortic")
+
+    session = db_session.scalar(
+        select(HeartMeasurementSession)
+        .where(HeartMeasurementSession.patient_id == "patient_001")
+        .order_by(HeartMeasurementSession.started_at.desc())
+    )
+    assert session is not None
+    assert session.state == "failed"
+    assert session.is_locked is False
+    assert fake_ble_service.active_capture_patient_id is None

@@ -1,5 +1,6 @@
 import random
 import time
+from contextlib import suppress
 from uuid import uuid4
 
 from sqlalchemy import desc, select
@@ -60,6 +61,11 @@ class MeasurementService:
     ) -> CurrentMeasurementResponse:
         patient = self._get_patient_or_404(patient_id, patient_name)
         active_session = self._get_active_session(patient.id)
+        if active_session and self._recover_interrupted_session(
+            active_session,
+            patient.id,
+        ):
+            active_session = None
         if active_session:
             started_at = ensure_utc(active_session.started_at)
             runtime_ms = max(
@@ -83,6 +89,46 @@ class MeasurementService:
                 )
                 stream_status = active_session.stream_status
                 signal_quality = active_session.signal_quality
+            expected_sample_count = (
+                self.settings.ble_sample_rate
+                * self.settings.ble_analysis_time_seconds
+            )
+            progress_reader = getattr(
+                self.ble_service,
+                "get_capture_progress_snapshot",
+                None,
+            )
+            if callable(progress_reader):
+                capture_progress = progress_reader(
+                    patient.id,
+                    size=self.settings.recording_progress_waveform_size,
+                )
+                captured_sample_count = capture_progress.sample_count
+                recorded_waveform = capture_progress.waveform
+            else:
+                captured_sample_count = self.ble_service.get_capture_sample_count(
+                    patient.id
+                )
+                recorded_waveform = waveform
+
+            ble_is_enabled = bool(
+                getattr(self.ble_service, "is_enabled", self.settings.ble_enabled)
+            )
+            if not ble_is_enabled:
+                recording_progress = min(
+                    runtime_ms
+                    / max(self.settings.ble_analysis_time_seconds * 1000, 1),
+                    1.0,
+                )
+                captured_sample_count = round(
+                    expected_sample_count * recording_progress
+                )
+                recorded_waveform = waveform
+            else:
+                recording_progress = min(
+                    captured_sample_count / max(expected_sample_count, 1),
+                    1.0,
+                )
             current_session = CurrentSessionResponse(
                 isRecording=True,
                 runtimeMs=runtime_ms,
@@ -90,6 +136,10 @@ class MeasurementService:
                 signalQuality=signal_quality,
                 activeAreaId=active_session.area_id,
                 waveform=waveform,
+                capturedSampleCount=captured_sample_count,
+                expectedSampleCount=expected_sample_count,
+                recordingProgress=recording_progress,
+                recordedWaveform=recorded_waveform,
             )
         else:
             current_session = CurrentSessionResponse(
@@ -128,7 +178,13 @@ class MeasurementService:
                 "areaId is not supported",
                 {"supportedAreaIds": list(AUSCULTATION_AREAS)},
             )
-        if self._get_active_session(patient.id):
+        active_session = self._get_active_session(patient.id)
+        if active_session and self._recover_interrupted_session(
+            active_session,
+            patient.id,
+        ):
+            active_session = None
+        if active_session:
             raise ConflictError(
                 "recording_already_running",
                 "Recording is already in progress for this patient",
@@ -139,87 +195,103 @@ class MeasurementService:
                 "BLE sensor is already streaming to another active patient session",
             )
 
-        area_meta = AUSCULTATION_AREAS[area_id]
+        session: HeartMeasurementSession | None = None
+        recording_id: str | None = None
         started_at = utcnow()
-        session = HeartMeasurementSession(
-            id=f"session_{uuid4().hex[:12]}",
-            patient_id=patient.id,
-            area_id=area_id,
-            area_label=area_meta["label"],
-            area_short=area_meta["short"],
-            state="recording",
-            is_locked=True,
-            started_at=started_at,
-            stopped_at=None,
-            stream_status=LIVE_STREAM_STATUS,
-            signal_quality=DEFAULT_SIGNAL_QUALITY,
-            waveform_seed=random.randint(10_000, 99_999),
-            created_at=started_at,
-            updated_at=started_at,
-        )
-        patient.latest_visit = started_at
-        self.db.add(session)
-        self.db.commit()
 
-        # PCGClient.analyze() runs for the configured capture window and yields
-        # BLE batches into the capture buffer.
-        captured_samples = self._await_capture(patient.id)
-
-        now = utcnow()
-        duration_ms = max(int((now - started_at).total_seconds() * 1000), 1000)
-        if self.settings.ble_enabled and not captured_samples:
-            self._mark_session_stopped(session, now)
+        try:
+            area_meta = AUSCULTATION_AREAS[area_id]
+            session = HeartMeasurementSession(
+                id=f"session_{uuid4().hex[:12]}",
+                patient_id=patient.id,
+                area_id=area_id,
+                area_label=area_meta["label"],
+                area_short=area_meta["short"],
+                state="recording",
+                is_locked=True,
+                started_at=started_at,
+                stopped_at=None,
+                stream_status=LIVE_STREAM_STATUS,
+                signal_quality=DEFAULT_SIGNAL_QUALITY,
+                waveform_seed=random.randint(10_000, 99_999),
+                created_at=started_at,
+                updated_at=started_at,
+            )
+            patient.latest_visit = started_at
+            self.db.add(session)
             self.db.commit()
-            raise ConflictError(
-                "no_ble_audio_captured",
-                "No BLE samples were captured for this recording session",
-                {
-                    "durationMs": duration_ms,
-                    "expectedSampleCount": int(
-                        duration_ms * self.settings.ble_sample_rate / 1000
-                    ),
-                },
-            )
-        if captured_samples:
-            waveform = normalize_waveform(captured_samples)
-        else:
-            waveform = generate_live_waveform(
-                size=min(self.settings.live_waveform_size, 180),
-                runtime_ms=duration_ms,
-                area_id=session.area_id,
-                seed=session.waveform_seed,
-            )
-        recording_id = f"rec_{uuid4().hex[:10]}"
-        self.audio_storage.save_wav(
-            recording_id=recording_id,
-            raw_samples=captured_samples,
-            waveform=waveform,
-            source_sample_rate=self.settings.ble_sample_rate,
-            audio_sample_rate=self.settings.audio_sample_rate,
-            gain=self.settings.audio_gain,
-        )
-        recording = HeartRecording(
-            id=recording_id,
-            patient_id=patient.id,
-            area_id=session.area_id,
-            area_label=session.area_label,
-            area_short=session.area_short,
-            started_at=started_at,
-            stopped_at=now,
-            duration_ms=duration_ms,
-            status=DEFAULT_RECORDING_STATUS,
-            audio_url=self.recording_service.build_audio_url(recording_id),
-            waveform_summary=self._build_waveform_summary(
-                waveform=waveform,
-                used_ble=bool(captured_samples),
+
+            # PCGClient.analyze() runs for the configured capture window and yields
+            # BLE batches into the capture buffer.
+            captured_samples = self._await_capture(patient.id)
+
+            now = utcnow()
+            duration_ms = max(int((now - started_at).total_seconds() * 1000), 1000)
+            if self.settings.ble_enabled and not captured_samples:
+                raise ConflictError(
+                    "no_ble_audio_captured",
+                    "No BLE samples were captured for this recording session",
+                    {
+                        "durationMs": duration_ms,
+                        "expectedSampleCount": int(
+                            duration_ms * self.settings.ble_sample_rate / 1000
+                        ),
+                    },
+                )
+            if captured_samples:
+                waveform = normalize_waveform(captured_samples)
+            else:
+                waveform = generate_live_waveform(
+                    size=min(self.settings.live_waveform_size, 180),
+                    runtime_ms=duration_ms,
+                    area_id=session.area_id,
+                    seed=session.waveform_seed,
+                )
+            recording_id = f"rec_{uuid4().hex[:10]}"
+            audio_source_sample_rate = self._audio_source_sample_rate(
                 captured_sample_count=len(captured_samples),
-            ),
-        )
-        self._mark_session_stopped(session, now)
-        patient.latest_visit = now
-        self.db.add(recording)
-        self.db.commit()
-        return ActionResponse(success=True, message="Recording stored")
+                duration_ms=duration_ms,
+            )
+            self.audio_storage.save_wav(
+                recording_id=recording_id,
+                raw_samples=captured_samples,
+                waveform=waveform,
+                source_sample_rate=audio_source_sample_rate,
+                audio_sample_rate=self.settings.audio_sample_rate,
+                gain=self.settings.audio_gain,
+            )
+            recording = HeartRecording(
+                id=recording_id,
+                patient_id=patient.id,
+                area_id=session.area_id,
+                area_label=session.area_label,
+                area_short=session.area_short,
+                started_at=started_at,
+                stopped_at=now,
+                duration_ms=duration_ms,
+                status=DEFAULT_RECORDING_STATUS,
+                audio_url=self.recording_service.build_audio_url(recording_id),
+                waveform_summary=self._build_waveform_summary(
+                    waveform=waveform,
+                    used_ble=bool(captured_samples),
+                    captured_sample_count=len(captured_samples),
+                    audio_source_sample_rate=audio_source_sample_rate,
+                ),
+            )
+            self._mark_session_stopped(session, now)
+            patient.latest_visit = now
+            self.db.add(recording)
+            self.db.commit()
+            return ActionResponse(success=True, message="Recording stored")
+        except Exception:
+            self.db.rollback()
+            with suppress(Exception):
+                self.ble_service.end_capture(patient.id)
+            if recording_id:
+                self.recording_service.remove_recording_files(recording_id)
+            if session:
+                self._mark_persisted_session_failed(session.id)
+            raise
 
     def _await_capture(self, patient_id: str) -> list[int]:
         """Block until the fixed-duration capture window finishes, then drain it.
@@ -228,7 +300,10 @@ class MeasurementService:
         we fall back to a synthetic waveform.
         """
         if self.settings.ble_enabled:
-            deadline = time.monotonic() + self.settings.ble_analysis_time_seconds
+            deadline = time.monotonic() + (
+                self.settings.ble_analysis_time_seconds
+                + self.settings.ble_capture_grace_seconds
+            )
             while time.monotonic() < deadline:
                 time.sleep(0.05)
         return self.ble_service.end_capture(patient_id)
@@ -236,9 +311,72 @@ class MeasurementService:
     @staticmethod
     def _mark_session_stopped(session: HeartMeasurementSession, now) -> None:
         session.state = "stopped"
+        session.is_locked = False
         session.stopped_at = now
         session.stream_status = "Stopped"
         session.updated_at = now
+
+    def _mark_persisted_session_failed(self, session_id: str) -> None:
+        try:
+            failed_session = self.db.get(HeartMeasurementSession, session_id)
+            if failed_session and failed_session.state == "recording":
+                now = utcnow()
+                failed_session.state = "failed"
+                failed_session.is_locked = False
+                failed_session.stopped_at = now
+                failed_session.stream_status = "Interrupted"
+                failed_session.signal_quality = "Unavailable"
+                failed_session.updated_at = now
+                self.db.commit()
+        except Exception:
+            self.db.rollback()
+
+    def _recover_interrupted_session(
+        self,
+        session: HeartMeasurementSession,
+        patient_id: str,
+    ) -> bool:
+        elapsed_seconds = max(
+            (utcnow() - ensure_utc(session.started_at)).total_seconds(),
+            0.0,
+        )
+        timeout_seconds = (
+            self.settings.ble_analysis_time_seconds
+            + self.settings.ble_capture_grace_seconds
+            + 10.0
+        )
+        timed_out = elapsed_seconds > timeout_seconds
+        capture_is_active = False
+        if self.settings.ble_enabled:
+            active_checker = getattr(self.ble_service, "is_capture_active", None)
+            if callable(active_checker):
+                capture_is_active = bool(active_checker(patient_id))
+            else:
+                capture_is_active = (
+                    getattr(
+                        self.ble_service,
+                        "active_capture_patient_id",
+                        None,
+                    )
+                    == patient_id
+                )
+
+        if not timed_out and (
+            not self.settings.ble_enabled or capture_is_active
+        ):
+            return False
+
+        with suppress(Exception):
+            self.ble_service.end_capture(patient_id)
+        now = utcnow()
+        session.state = "failed"
+        session.is_locked = False
+        session.stopped_at = now
+        session.stream_status = "Interrupted"
+        session.signal_quality = "Unavailable"
+        session.updated_at = now
+        self.db.commit()
+        return True
 
     def _get_patient_or_404(self, patient_id: str | None, patient_name: str | None) -> Patient:
         patient = self.patient_service.resolve_patient(patient_id, patient_name)
@@ -281,6 +419,7 @@ class MeasurementService:
         waveform: list[float],
         used_ble: bool,
         captured_sample_count: int,
+        audio_source_sample_rate: float,
     ) -> dict:
         summary = summarize_waveform(waveform)
         summary.update(
@@ -288,6 +427,7 @@ class MeasurementService:
                 "source": "ble" if used_ble else "synthetic",
                 "rawSampleCount": captured_sample_count,
                 "sampleRate": self.settings.ble_sample_rate,
+                "audioSourceSampleRate": audio_source_sample_rate,
                 "batchSize": self.settings.ble_batch_size,
                 "audioSampleRate": self.settings.audio_sample_rate,
                 "audioGain": self.settings.audio_gain,
@@ -296,3 +436,13 @@ class MeasurementService:
             }
         )
         return summary
+
+    def _audio_source_sample_rate(
+        self,
+        *,
+        captured_sample_count: int,
+        duration_ms: int,
+    ) -> float:
+        if captured_sample_count > 0 and duration_ms > 0:
+            return captured_sample_count * 1000.0 / duration_ms
+        return float(self.settings.ble_sample_rate)

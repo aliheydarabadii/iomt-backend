@@ -17,7 +17,7 @@ class AudioStorage:
         recording_id: str,
         raw_samples: list[int] | None,
         waveform: list[float] | None,
-        source_sample_rate: int,
+        source_sample_rate: float,
         audio_sample_rate: int,
         gain: float,
     ) -> Path:
@@ -41,7 +41,7 @@ class AudioStorage:
         *,
         raw_samples: list[int],
         waveform: list[float],
-        source_sample_rate: int,
+        source_sample_rate: float,
         audio_sample_rate: int,
         gain: float,
     ) -> bytes:
@@ -74,13 +74,15 @@ class AudioStorage:
         return [max(-1.0, min(1.0, (sample - 0.5) * 2.0)) for sample in waveform]
 
     @staticmethod
-    def _upsample(samples: list[float], source_rate: int, target_rate: int) -> list[float]:
+    def _upsample(samples: list[float], source_rate: float, target_rate: int) -> list[float]:
         if not samples:
             return [0.0]
         if source_rate <= 0 or target_rate <= 0 or source_rate == target_rate:
             return samples
-        if target_rate % source_rate == 0:
-            factor = target_rate // source_rate
+        ratio = target_rate / source_rate
+        rounded_ratio = round(ratio)
+        if rounded_ratio > 1 and abs(ratio - rounded_ratio) < 1e-9:
+            factor = int(rounded_ratio)
             return [sample for sample in samples for _ in range(factor)]
 
         output_length = max(1, round(len(samples) * target_rate / source_rate))
