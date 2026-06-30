@@ -169,7 +169,7 @@ def test_recording_analysis_endpoint_returns_plotting_json(client) -> None:
     pytest.importorskip("numpy")
     pytest.importorskip("scipy")
     pytest.importorskip("pywt")
-    pytest.importorskip("sklearn")
+    pytest.importorskip("librosa")
 
     record = client.post(
         "/api/heart-measurements/patient_003/record",
@@ -192,20 +192,33 @@ def test_recording_analysis_endpoint_returns_plotting_json(client) -> None:
     payload = response.json()
     assert payload["recordingId"] == recording_id
     assert payload["audioUrl"] == f"/api/heart-recordings/{recording_id}/audio"
+    assert payload["filteredAudioUrl"] == (
+        f"/api/heart-recordings/{recording_id}/filtered-audio"
+    )
     assert payload["plot"]["sampleRateHz"] == 500
     assert payload["plot"]["pointCount"] == len(payload["plot"]["timeAxisS"])
     assert payload["plot"]["pointCount"] == len(payload["plot"]["amplitude"])
     assert payload["plot"]["pointCount"] == len(payload["plot"]["envelope"])
     assert payload["analysis"]["file_info"]["sample_rate_hz"] == 500
     assert "segmentation" in payload["analysis"]
+    assert "robust_hrv" in payload["analysis"]
+    assert "signal_quality" in payload["analysis"]
+    assert "morphology" in payload["analysis"]
+    assert "advanced_activity" in payload["analysis"]
+    assert "robust_outliers" in payload["analysis"]["classification"]
+    assert "isolation_forest" not in payload["analysis"]["classification"]
     assert "signals" in payload["analysis"]
+    filtered_audio = client.get(payload["filteredAudioUrl"])
+    assert filtered_audio.status_code == 200
+    assert filtered_audio.headers["content-type"].startswith("audio/wav")
+    assert len(filtered_audio.content) > 44
 
 
 def test_recording_analysis_endpoint_rejects_non_local_seed_audio(client) -> None:
     pytest.importorskip("numpy")
     pytest.importorskip("scipy")
     pytest.importorskip("pywt")
-    pytest.importorskip("sklearn")
+    pytest.importorskip("librosa")
 
     response = client.get("/api/heart-recordings/rec_001/analysis")
 

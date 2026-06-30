@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     audio_storage_dir: str = "storage/audio"
     idle_waveform_size: int = 180
     live_waveform_size: int = 180
+    recording_progress_waveform_size: int = 600
     log_level: str = "INFO"
     ble_enabled: bool = True
     ble_autostart: bool = False

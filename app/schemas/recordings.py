@@ -8,7 +8,7 @@ from app.schemas.common import APIModel
 
 class RecordingAnalysisQuery(APIModel):
     includeSignals: bool = True
-    saveFilteredWav: bool = False
+    saveFilteredWav: bool = True
     maxPoints: int = Field(default=3000, ge=100, le=10000)
 
 
@@ -29,6 +29,7 @@ class RecordingPlotResponse(APIModel):
 class RecordingAnalysisResponse(APIModel):
     recordingId: str
     audioUrl: str
+    filteredAudioUrl: str | None = None
     generatedAt: datetime
     plot: RecordingPlotResponse | None = None
     analysis: dict[str, Any]

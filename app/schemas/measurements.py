@@ -34,6 +34,10 @@ class CurrentSessionResponse(APIModel):
     signalQuality: str
     activeAreaId: str | None = None
     waveform: list[float]
+    capturedSampleCount: int = 0
+    expectedSampleCount: int = 0
+    recordingProgress: float = 0.0
+    recordedWaveform: list[float] = Field(default_factory=list)
 
 
 class MeasurementControlsResponse(APIModel):

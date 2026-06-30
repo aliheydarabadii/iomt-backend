@@ -20,6 +20,9 @@ class RecordingService:
     def build_audio_url(self, recording_id: str) -> str:
         return f"{self.settings.api_prefix}/heart-recordings/{recording_id}/audio"
 
+    def build_filtered_audio_url(self, recording_id: str) -> str:
+        return f"{self.settings.api_prefix}/heart-recordings/{recording_id}/filtered-audio"
+
     def build_analysis_url(self, recording_id: str) -> str:
         return f"{self.settings.api_prefix}/heart-recordings/{recording_id}/analysis"
 
@@ -28,10 +31,17 @@ class RecordingService:
 
         local_file = self._get_local_audio_path(recording_id)
         if local_file.exists():
+            playback_file, _ = self._ensure_browser_playback_wav(
+                local_file,
+                self._get_original_playback_audio_path(recording_id),
+            )
             return FileResponse(
-                path=local_file,
+                path=playback_file,
                 media_type="audio/wav",
-                filename=f"{recording_id}.wav",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Disposition": f'inline; filename="{recording_id}.wav"',
+                },
             )
 
         parsed = urlparse(recording.audio_url)
@@ -41,6 +51,28 @@ class RecordingService:
         raise NotFoundError(
             "recording_audio_not_found",
             "Recorded audio file was not found",
+            {"recordingId": recording_id},
+        )
+
+    def get_filtered_audio_response(self, recording_id: str) -> Response:
+        self._get_recording_or_404(recording_id)
+        filtered_file = self._get_filtered_audio_path(recording_id)
+        if filtered_file.exists():
+            self._make_filtered_wav_browser_playable(filtered_file)
+            return FileResponse(
+                path=filtered_file,
+                media_type="audio/wav",
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Disposition": (
+                        f'inline; filename="{recording_id}_filtered.wav"'
+                    ),
+                },
+            )
+
+        raise NotFoundError(
+            "recording_filtered_audio_not_found",
+            "Filtered audio is not available. Run analysis with saveFilteredWav enabled.",
             {"recordingId": recording_id},
         )
 
@@ -73,13 +105,23 @@ class RecordingService:
 
         output_filename = None
         if save_filtered_wav:
-            output_filename = str(local_file.with_name(f"{recording_id}_filtered.wav"))
+            output_filename = str(self._get_filtered_audio_path(recording_id))
 
         analysis = run_pcg_pipeline(
             filename=str(local_file),
             save_filtered_wav=save_filtered_wav,
             output_filename=output_filename,
             include_signals=include_signals,
+        )
+        if output_filename and analysis.get("exports", {}).get("saved_filtered_wav"):
+            playback_sample_rate = self._make_filtered_wav_browser_playable(
+                Path(output_filename)
+            )
+            analysis["exports"]["filtered_wav_sample_rate_hz"] = playback_sample_rate
+        filtered_audio_url = (
+            self.build_filtered_audio_url(recording.id)
+            if analysis.get("exports", {}).get("saved_filtered_wav")
+            else None
         )
 
         plot = None
@@ -93,10 +135,21 @@ class RecordingService:
         return RecordingAnalysisResponse(
             recordingId=recording.id,
             audioUrl=self.build_audio_url(recording.id),
+            filteredAudioUrl=filtered_audio_url,
             generatedAt=utcnow(),
             plot=plot,
             analysis=analysis,
         )
+
+    def delete_recording(self, recording_id: str) -> None:
+        recording = self._get_recording_or_404(recording_id)
+        self.db.delete(recording)
+        self.db.commit()
+        self.remove_recording_files(recording_id)
+
+    def remove_recording_files(self, recording_id: str) -> None:
+        for path in self._recording_file_paths(recording_id):
+            path.unlink(missing_ok=True)
 
     def _get_recording_or_404(self, recording_id: str) -> HeartRecording:
         recording = self.db.get(HeartRecording, recording_id)
@@ -106,6 +159,74 @@ class RecordingService:
 
     def _get_local_audio_path(self, recording_id: str) -> Path:
         return Path(self.settings.audio_storage_dir) / f"{recording_id}.wav"
+
+    def _get_filtered_audio_path(self, recording_id: str) -> Path:
+        return Path(self.settings.audio_storage_dir) / f"{recording_id}_filtered.wav"
+
+    def _get_original_playback_audio_path(self, recording_id: str) -> Path:
+        return Path(self.settings.audio_storage_dir) / f"{recording_id}_playback.wav"
+
+    def _recording_file_paths(self, recording_id: str) -> tuple[Path, ...]:
+        return (
+            self._get_local_audio_path(recording_id),
+            self._get_filtered_audio_path(recording_id),
+            self._get_original_playback_audio_path(recording_id),
+        )
+
+    @staticmethod
+    def _make_filtered_wav_browser_playable(
+        filtered_file: Path,
+        *,
+        minimum_sample_rate: int = 8000,
+    ) -> int:
+        _, sample_rate = RecordingService._ensure_browser_playback_wav(
+            filtered_file,
+            filtered_file,
+            minimum_sample_rate=minimum_sample_rate,
+        )
+        return sample_rate
+
+    @staticmethod
+    def _ensure_browser_playback_wav(
+        source_file: Path,
+        playback_file: Path,
+        *,
+        minimum_sample_rate: int = 8000,
+    ) -> tuple[Path, int]:
+        import numpy as np
+        from scipy.io import wavfile
+        from scipy.signal import resample_poly
+
+        sample_rate, samples = wavfile.read(source_file)
+        if sample_rate >= minimum_sample_rate:
+            return source_file, int(sample_rate)
+
+        if (
+            playback_file != source_file
+            and playback_file.exists()
+            and playback_file.stat().st_mtime >= source_file.stat().st_mtime
+        ):
+            playback_rate, _ = wavfile.read(playback_file)
+            if playback_rate >= minimum_sample_rate:
+                return playback_file, int(playback_rate)
+
+        resampled = resample_poly(
+            samples.astype(np.float64),
+            minimum_sample_rate,
+            sample_rate,
+            axis=0,
+        )
+        if np.issubdtype(samples.dtype, np.integer):
+            limits = np.iinfo(samples.dtype)
+            resampled = np.clip(np.rint(resampled), limits.min, limits.max).astype(
+                samples.dtype
+            )
+        else:
+            resampled = resampled.astype(samples.dtype)
+
+        playback_file.parent.mkdir(parents=True, exist_ok=True)
+        wavfile.write(playback_file, minimum_sample_rate, resampled)
+        return playback_file, minimum_sample_rate
 
     def _build_plot_payload(
         self,

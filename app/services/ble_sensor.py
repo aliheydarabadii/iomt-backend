@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import logging
+import math
 import threading
 import time
 from collections import deque
@@ -28,6 +29,12 @@ class LiveWaveformSnapshot:
     stream_status: str
     signal_quality: str
     has_live_data: bool
+
+
+@dataclass(slots=True)
+class CaptureProgressSnapshot:
+    waveform: list[float]
+    sample_count: int
 
 
 @dataclass(slots=True)
@@ -66,7 +73,7 @@ class BLEIngestionService:
         self._recent_samples: deque[int] = deque(
             maxlen=max(settings.live_waveform_size, settings.ble_recent_buffer_size)
         )
-        self._capture_samples: deque[int] = deque(maxlen=settings.ble_capture_buffer_size)
+        self._capture_samples: deque[int] = deque(maxlen=self._capture_buffer_size())
         self._active_capture_patient_id: str | None = None
         self._last_batch_monotonic: float | None = None
         self._last_batch_at: datetime | None = None
@@ -179,6 +186,12 @@ class BLEIngestionService:
         with self._lock:
             return self._active_capture_patient_id == patient_id
 
+    def is_capture_active(self, patient_id: str) -> bool:
+        if not self.is_enabled:
+            return False
+        with self._lock:
+            return self._active_capture_patient_id == patient_id
+
     def get_capture_sample_count(self, patient_id: str) -> int:
         if not self.is_enabled:
             return 0
@@ -186,6 +199,24 @@ class BLEIngestionService:
             if self._active_capture_patient_id != patient_id:
                 return 0
             return len(self._capture_samples)
+
+    def get_capture_progress_snapshot(
+        self,
+        patient_id: str,
+        *,
+        size: int,
+    ) -> CaptureProgressSnapshot:
+        if not self.is_enabled:
+            return CaptureProgressSnapshot(waveform=[], sample_count=0)
+        with self._lock:
+            if self._active_capture_patient_id != patient_id:
+                return CaptureProgressSnapshot(waveform=[], sample_count=0)
+            samples = list(self._capture_samples)
+
+        return CaptureProgressSnapshot(
+            waveform=self._downsample_capture_waveform(samples, size=max(1, size)),
+            sample_count=len(samples),
+        )
 
     def end_capture(self, patient_id: str) -> list[int]:
         if not self.is_enabled:
@@ -330,7 +361,12 @@ class BLEIngestionService:
 
         while self._is_current_run(run_id):
             client = PCGClient(
-                device_name=self.settings.ble_device_name or PCGClientConfig.patient_name
+                device_name=self.settings.ble_device_name or PCGClientConfig.patient_name,
+                device_address=self.settings.ble_device_address,
+                service_uuid=self.settings.ble_service_uuid,
+                characteristic_uuid=self.settings.ble_characteristic_uuid,
+                scan_timeout_seconds=self.settings.ble_scan_timeout_seconds,
+                connect_timeout_seconds=self.settings.ble_connect_timeout_seconds,
             )
             try:
                 self._set_connection_state("scanning")
@@ -344,6 +380,10 @@ class BLEIngestionService:
                         break
                     patient_id, patient_name = request
                     await self._run_capture(client, patient_id, patient_name)
+                    # Arduino BLE stacks can retain stale notification/GATT state
+                    # after a completed capture. Reconnect before accepting the
+                    # next request so every recording starts from a clean link.
+                    break
 
                 self._set_connection_state("disconnected")
                 logger.info("[BLE] Disconnected")
@@ -351,11 +391,13 @@ class BLEIngestionService:
                 self._set_connection_state(f"error:{exc}")
                 with self._lock:
                     self._last_error = str(exc)
+                self._requeue_active_capture_request()
                 logger.warning("[BLE] %s", exc)
             except Exception as exc:  # pragma: no cover - depends on hardware/runtime
                 self._set_connection_state(f"error:{exc}")
                 with self._lock:
                     self._last_error = str(exc)
+                self._requeue_active_capture_request()
                 logger.exception("BLE worker error", exc_info=exc)
             finally:
                 with suppress(Exception):
@@ -446,6 +488,11 @@ class BLEIngestionService:
         with self._lock:
             return self._active_capture_patient_id == patient_id
 
+    def _requeue_active_capture_request(self) -> None:
+        with self._lock:
+            if self._active_capture_patient_id:
+                self._capture_requested.set()
+
     def _consume_samples(self, values, *, patient_id: str | None = None) -> None:
         n_samples = len(values)
         if n_samples <= 0:
@@ -471,6 +518,31 @@ class BLEIngestionService:
                 n_samples,
                 values[0],
             )
+
+    def _capture_buffer_size(self) -> int:
+        expected_capture_samples = math.ceil(
+            self.settings.ble_sample_rate
+            * (self.settings.ble_analysis_time_seconds + self.settings.ble_capture_grace_seconds)
+        )
+        return max(self.settings.ble_capture_buffer_size, expected_capture_samples, 1)
+
+    @staticmethod
+    def _downsample_capture_waveform(samples: list[int], *, size: int) -> list[float]:
+        if not samples:
+            return []
+        normalized = normalize_waveform(samples)
+        if len(normalized) <= size:
+            return normalized
+
+        bucket_size = len(normalized) / size
+        result: list[float] = []
+        for bucket in range(size):
+            start = int(bucket * bucket_size)
+            end = max(start + 1, int((bucket + 1) * bucket_size))
+            values = normalized[start:min(end, len(normalized))]
+            peak = max(values, key=lambda value: abs(value - 0.5))
+            result.append(round(peak, 4))
+        return result
 
     def _matches_advertised_device(self, device, advertisement_data) -> bool:
         return bool(self._device_match_reasons(device, advertisement_data))
